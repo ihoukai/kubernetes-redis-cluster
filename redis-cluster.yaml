@@ -1,0 +1,212 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster
+data:
+  redis-cluster.sh: |+
+    #!/bin/sh
+
+    REDIS_NODES="/data/nodes.conf"
+    DOMAIN=$(hostname -d)
+
+    function log() {
+        local time=$(date "+%Y-%m-%d %H:%M:%S")
+        for msg in "$@"; do
+            echo "${time} ${msg}"
+        done
+    }
+
+    function run_util_success() {
+        local result
+        while true
+        do
+            result=$("$@")
+            if [ $? -eq 0 ]; then
+                break
+            fi
+            sleep 1
+        done
+        echo "${result}"
+    }
+
+    function get_ip() {
+        local domin=$1
+        local info=$(run_util_success nslookup "${domin}" 2>/dev/null)
+        echo -n "${info}"|grep Address|grep -oE '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}'|head -n 1
+    }
+
+    function get_nodename() {
+        local ip=$1
+        local info=$(run_util_success redis-cli -h "${ip}" cluster nodes)
+        echo "$info"|grep myself|awk '{print $1}'
+    }
+
+    function get_cluster_size() {
+        local info=$(run_util_success redis-cli cluster info)
+        echo "$info"|grep cluster_size|grep -oE [0-9]+
+    }
+
+    function get_cluster_state() {
+        local info=$(run_util_success redis-cli cluster info)
+        echo "${info}"|grep cluster_state|grep -oE ':[a-zA-Z]+'|grep -oE '[a-zA-Z]+'
+    }
+
+    function create_cluster() {
+        log "create cluster"
+        log "redis-cli --cluster create --cluster-replicas 1 $@"
+        while true
+        do
+            echo yes|redis-cli --cluster create --cluster-replicas 1 $@
+            if [ $? -eq 0 ]; then
+                break
+            fi
+            sleep 1
+        done
+    }
+
+    function get_pod_ip_list() {
+        local pod_ips=""
+        local replicas=${STATEFULSET_REPLICAS}
+        for i in $(seq ${replicas}); do
+            let i=i-1
+            local ip=$(get_ip ${STATEFULSET_NAME}-${i}.${DOMAIN})
+            pod_ips="${pod_ips} ${ip}:6379"
+        done
+        echo "${pod_ips}"
+    }
+
+    function keep_ip_correct() {
+        log "keep ip correct"
+        local replicas=${STATEFULSET_REPLICAS}
+        for i in $(seq ${replicas}); do
+            let i=i-1
+            local ip=$(get_ip ${STATEFULSET_NAME}-${i}.${DOMAIN})
+            local nodename=$(get_nodename "${ip}")
+            log "${nodename} ${ip}"
+            sed -i "s/${nodename} [0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}/${nodename} ${ip}/g" ${REDIS_NODES}
+        done
+    }
+
+    function create_cluster_or_not() {
+        if [ "${HOSTNAME}" = "${STATEFULSET_NAME}-0" ]; then
+            local cluster_size=$(get_cluster_size)
+            if [ "${cluster_size}" -eq 0 ]; then
+                log "lookup pod ip list"
+                local pod_ip_list=$(get_pod_ip_list)
+                sleep 5
+                create_cluster ${pod_ip_list}
+            fi
+        fi
+    }
+
+    function start_redis_daemon() {
+        $@ &
+        sleep 5
+    }
+
+    function start_redis_foreground() {
+        exec $@
+    }
+
+    function shutdown_redis() {
+        redis-cli shutdown
+        sleep 3
+    }
+
+    start_redis_daemon "$@" && create_cluster_or_not && keep_ip_correct && shutdown_redis && start_redis_foreground "$@"
+
+  redis.conf: |+
+    cluster-enabled yes
+    cluster-require-full-coverage no
+    cluster-node-timeout 5000
+    cluster-config-file /data/nodes.conf
+    cluster-migration-barrier 1
+    appendonly yes
+    protected-mode no
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+spec:
+  podManagementPolicy: Parallel
+  serviceName: redis-cluster
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis-cluster
+  template:
+    metadata:
+      labels:
+        app: redis-cluster
+    spec:
+      containers:
+      - name: redis
+        image: redis:5.0.1-alpine
+        ports:
+        - containerPort: 6379
+          name: client
+        - containerPort: 16379
+          name: gossip
+        command: ["/conf/redis-cluster.sh", "redis-server", "/conf/redis.conf"]
+        env:
+        - name: STATEFULSET_NAME
+          value : "redis-cluster"
+        - name: STATEFULSET_REPLICAS
+          value : 6
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "redis-cli ping"
+          initialDelaySeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "redis-cli ping"
+          initialDelaySeconds: 15
+          periodSeconds: 3
+        volumeMounts:
+        - name: conf
+          mountPath: /conf
+          readOnly: false
+        - name: data
+          mountPath: /data
+          readOnly: false
+      volumes:
+      - name: conf
+        configMap:
+          name: redis-cluster
+          defaultMode: 0755
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: local-storage
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: client
+  - port: 16379
+    targetPort: 16379
+    name: gossip
+  selector:
+    app: redis-cluster
